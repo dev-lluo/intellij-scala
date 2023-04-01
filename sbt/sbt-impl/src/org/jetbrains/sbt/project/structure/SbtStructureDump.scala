@@ -42,6 +42,7 @@ class SbtStructureDump {
 
   // in failed tests we would like to see sbt process output
   private val processOutputBuilder = new mutable.StringBuilder
+
   def processOutput: String = processOutputBuilder.mkString
 
   def cancel(): Unit = cancellationFlag.set(true)
@@ -91,18 +92,26 @@ class SbtStructureDump {
     val setCommands = Seq(
       """historyPath := None""",
       s"""shellPrompt := { _ => "" }""",
-      s"""SettingKey[_root_.scala.Option[_root_.sbt.File]]("sbtStructureOutputFile") in _root_.sbt.Global := _root_.scala.Some(_root_.sbt.file("$structureFilePath"))""",
+      if (WslUtil.isOnWSL(vmExecutable)) {
+        s"""SettingKey[_root_.scala.Option[_root_.sbt.File]]("sbtStructureOutputFile") in _root_.sbt.Global := _root_.scala.Some(_root_.sbt.file("${WslUtil.normalizePath(structureFilePath)}"))"""
+      } else {
+        s"""SettingKey[_root_.scala.Option[_root_.sbt.File]]("sbtStructureOutputFile") in _root_.sbt.Global := _root_.scala.Some(_root_.sbt.file("$structureFilePath"))"""
+      },
       s"""SettingKey[_root_.java.lang.String]("sbtStructureOptions") in _root_.sbt.Global := "$optString""""
     ).mkString("set _root_.scala.collection.Seq(", ",", ")")
 
     val sbtCommands = (
       Seq(
         setCommands,
-        s"""apply -cp "${normalizePath(sbtStructureJar)}" org.jetbrains.sbt.CreateTasks"""
+        if (WslUtil.isOnWSL(vmExecutable)) {
+          s"""apply -cp "${WslUtil.normalizePath(sbtStructureJar)}" org.jetbrains.sbt.CreateTasks"""
+        } else {
+          s"""apply -cp "${normalizePath(sbtStructureJar)}" org.jetbrains.sbt.CreateTasks"""
+        }
       ) :++
-      (if (preferScala2) Seq("preferScala2") else Seq.empty) :+
-      s"*/*:dumpStructure"
-    ).mkString(";", ";", "")
+        (if (preferScala2) Seq("preferScala2") else Seq.empty) :+
+        s"*/*:dumpStructure"
+      ).mkString(";", ";", "")
 
 
     runSbt(
@@ -188,15 +197,47 @@ class SbtStructureDump {
     val allJvmOpts = JvmOpts.loadFrom(directory) ++ vmOptions ++ sbtOpts
 
     val allSbtLauncherArgs = mappedSbtOpts.collect { case a: SbtLauncherOption => a.value } ++ sbtLauncherArgs
-    val processCommandsRaw =
+    val processCommandsRaw = if (WslUtil.isOnWSL(vmExecutable)) {
+      val wslDistribution = WslUtil.getWslDistribution(vmExecutable).get
+      List(
+        "wsl",
+        "-d",
+        wslDistribution,
+        "bash",
+        "-i",
+        "-c",
+        {
+          val processCommands = List(
+            "-Djline.terminal=jline.UnsupportedTerminal",
+            "-Dsbt.log.noformat=true",
+            "-Dfile.encoding=UTF-8") ++
+            allJvmOpts ++
+            List("-jar", WslUtil.normalizePath(sbtLauncher)) ++ allSbtLauncherArgs // :+ "--debug"
+
+          val generalCommandLine = new GeneralCommandLine(processCommands.asJava)
+            .withParentEnvironmentType(GeneralCommandLine.ParentEnvironmentType.CONSOLE)
+          val processBuilder = generalCommandLine.toProcessBuilder
+          (WslUtil.normalizePath(vmExecutable) +: processBuilder.command().asScala.map { s =>
+            if (s.charAt(0) == '"' && s.charAt(s.length - 1) == '"') {
+              val array = s.toCharArray
+              array(0) = '\''
+              array(array.length - 1) = '\''
+              new String(array)
+            } else {
+              s
+            }
+          }).mkString(" ")
+        }
+      )
+    } else {
       List(
         normalizePath(vmExecutable),
         "-Djline.terminal=jline.UnsupportedTerminal",
         "-Dsbt.log.noformat=true",
         "-Dfile.encoding=UTF-8") ++
         allJvmOpts ++
-      List("-jar", normalizePath(sbtLauncher)) ++
-      allSbtLauncherArgs// :+ "--debug"
+        List("-jar", normalizePath(sbtLauncher)) ++ allSbtLauncherArgs // :+ "--debug"
+    }
 
     val processCommands = processCommandsRaw.filterNot(_.isEmpty)
 
@@ -359,7 +400,7 @@ object SbtStructureDump {
 
     if (ApplicationManager.getApplication.isUnitTestMode && !dontPrintErrorsAndWarningsToConsoleDuringTests) {
       val isErrorOrWarning = text.startsWith("[warn]") || text.startsWith("[error]")
-      if (isErrorOrWarning){
+      if (isErrorOrWarning) {
         System.err.println(text)
       }
     }
@@ -376,7 +417,7 @@ object SbtStructureDump {
   private def shellMessageAggregator(dumpTaskId: EventId,
                                      shell: SbtShellCommunication,
                                      reporter: BuildReporter,
-                                   ): EventAggregator[BuildMessages] = {
+                                    ): EventAggregator[BuildMessages] = {
     case (messages, TaskStart) =>
       reporter.startTask(dumpTaskId, None, SbtBundle.message("sbt.extracting.project.structure.from.sbt.shell"))
       messages
